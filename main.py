@@ -53,6 +53,7 @@ def extract_start_time(text: str) -> str | None:
     Handles various formats:
     - 開演 HH:MM (Japanese: performance start)
     - Starts HH:MM
+    - Start time HH:MM
     - start HH:MM
     - 開始 HH:MM
 
@@ -67,6 +68,7 @@ def extract_start_time(text: str) -> str | None:
     patterns = [
         r"開演\s*(\d{1,2}:\d{2})",  # Japanese: 開演 17:00
         r"開始\s*(\d{1,2}:\d{2})",  # Japanese: 開始 17:00
+        r"[Ss]tarts?\s+time\s+(\d{1,2}:\d{2})",  # English: Start time 17:00
         r"[Ss]tarts?\s*(\d{1,2}:\d{2})",  # English: Starts 17:00 or start 17:00
         r"／開演\s*(\d{1,2}:\d{2})",  # With separator: ／開演 17:00
     ]
@@ -99,13 +101,57 @@ def extract_event_name(cell: BeautifulSoup) -> str | None:
     # Fall back to cell text, removing time information
     text = cell.get_text(strip=True)
     # Remove common prefixes like コンサート, 野球, etc.
-    prefixes = ["コンサート", "野球", "格闘技", "イベント", "展示会"]
+    prefixes = ["コンサート", "スポーツ", "その他", "野球"]
     for prefix in prefixes:
         if text.startswith(prefix):
             text = text[len(prefix) :].strip()
             break
 
     return text if text else None
+
+
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+
+
+def find_month_table(soup: BeautifulSoup, year: int, month: int) -> BeautifulSoup | None:
+    """Find the table element for a specific month.
+
+    The page uses <p class="c-ttl-set-calender"> to mark each month section.
+    The text can be Japanese (e.g., "2025年12月") or English (e.g., "December 2025").
+
+    Args:
+        soup: BeautifulSoup parsed HTML.
+        year: Target year (e.g., 2025).
+        month: Target month (1-12).
+
+    Returns:
+        The table element for the specified month, or None if not found.
+    """
+    # Build patterns to match the month header
+    # Japanese format: 2025年12月 (with zero-padded month)
+    japanese_pattern = f"{year}年{month:02d}月"
+    # English format: December 2025
+    english_pattern = f"{MONTH_NAMES[month - 1]} {year}"
+
+    # Find all month header elements
+    month_headers = soup.find_all("p", class_="c-ttl-set-calender")
+
+    for header in month_headers:
+        # Get the raw HTML to check for Japanese text in comments
+        header_html = str(header)
+        header_text = header.get_text(strip=True)
+
+        # Check if this header matches our target month
+        if japanese_pattern in header_html or japanese_pattern in header_text or english_pattern in header_text:
+            # Find the next table after this header
+            table = header.find_next("table")
+            if table:
+                return table
+
+    return None
 
 
 def parse_events(html: str, year: int, month: int) -> list[Event]:
@@ -122,29 +168,8 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
     soup = BeautifulSoup(html, "lxml")
     events: list[Event] = []
 
-    # Find the section for the target month
-    # The page has headers like "2025年12月" for each month
-    month_header = f"{year}年{month}月"
-
-    # Find all tables on the page
-    tables = soup.find_all("table")
-
-    target_table = None
-    for table in tables:
-        # Check if this table is preceded by the month header
-        prev_elements = table.find_all_previous(string=re.compile(month_header))
-        if prev_elements:
-            # Check if this is the closest table to that header
-            target_table = table
-            break
-
-    if not target_table:
-        # Alternative: look for month in heading elements
-        for heading in soup.find_all(["h2", "h3", "h4", "p", "div"]):
-            if month_header in heading.get_text():
-                # Find the next table after this heading
-                target_table = heading.find_next("table")
-                break
+    # Find the table for the target month
+    target_table = find_month_table(soup, year, month)
 
     if not target_table:
         return events
@@ -178,10 +203,8 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         if not event_name:
             continue
 
-        # Extract start time
-        start_time = extract_start_time(cell_text)
-        if not start_time:
-            continue
+        # Extract start time (default to "00:00" if not found)
+        start_time = extract_start_time(cell_text) or "00:00"
 
         # Format date as YYYY-MM-DD
         date_str = f"{year}-{month:02d}-{day:02d}"
@@ -197,15 +220,38 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
     return events
 
 
-def get_current_month_events() -> list[Event]:
-    """Fetch and parse events for the current month.
+def get_next_month(year: int, month: int) -> tuple[int, int]:
+    """Get the next month's year and month.
+
+    Args:
+        year: Current year.
+        month: Current month (1-12).
 
     Returns:
-        List of Event dictionaries for the current month.
+        Tuple of (year, month) for the next month.
+    """
+    if month == 12:
+        return year + 1, 1
+    return year, month + 1
+
+
+def get_events() -> list[Event]:
+    """Fetch and parse events for the current month and next month.
+
+    Returns:
+        List of Event dictionaries for current and next month.
     """
     now = datetime.now()
     html = fetch_schedule_html()
-    return parse_events(html, now.year, now.month)
+
+    # Parse current month
+    events = parse_events(html, now.year, now.month)
+
+    # Parse next month
+    next_year, next_month = get_next_month(now.year, now.month)
+    events.extend(parse_events(html, next_year, next_month))
+
+    return events
 
 
 def escape_sql_string(value: str) -> str:
@@ -306,9 +352,9 @@ def save_events_to_d1(events: list[Event]) -> bool:
 
 
 def main() -> None:
-    """Main entry point - fetches and optionally saves current month events."""
+    """Main entry point - fetches and optionally saves events for current and next month."""
     parser = argparse.ArgumentParser(
-        description="Parse Tokyo Dome events and optionally save to Cloudflare D1."
+        description="Parse Tokyo Dome events (current + next month) and optionally save to Cloudflare D1."
     )
     parser.add_argument(
         "--save",
@@ -318,7 +364,7 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        events = get_current_month_events()
+        events = get_events()
         print(json.dumps(events, ensure_ascii=False, indent=2))
         print(f"\nTotal events found: {len(events)}")
 
