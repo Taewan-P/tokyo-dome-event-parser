@@ -38,4 +38,5 @@ jobs:
       - name: Parse and save events to D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PYTHONUNBUFFERED: "1"
         run: uv run python main.py --save
