@@ -9,6 +9,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from datetime import datetime
 from typing import TypedDict
 
@@ -323,12 +324,16 @@ def main() -> None:
 
         if args.save:
             print("\nSaving to Cloudflare D1...")
-            save_events_to_d1(events)
+            success = save_events_to_d1(events)
+            if not success:
+                sys.exit(1)
 
     except requests.RequestException as e:
         print(f"Error fetching schedule: {e}")
+        sys.exit(1)
     except Exception as e:
         print(f"Error parsing schedule: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
