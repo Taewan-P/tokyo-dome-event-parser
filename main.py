@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime
 from typing import TypedDict
 
@@ -19,6 +20,38 @@ from bs4 import BeautifulSoup
 # Constants
 SCHEDULE_URL = "https://www.tokyo-dome.co.jp/en/dome/event/schedule.html"
 D1_DATABASE_NAME = "tokyo-dome-events"
+
+
+def normalize_event_name(name: str) -> str:
+    """Normalize event name for deduplication comparison.
+
+    Handles:
+    - Full-width to half-width character conversion (NFKC normalization)
+    - Multiple spaces collapsed to single space
+    - Case-insensitive (lowercased)
+    - Japanese quotes 「」 to regular quotes ""
+    - Trim whitespace
+
+    Args:
+        name: Raw event name.
+
+    Returns:
+        Normalized event name for comparison.
+    """
+    # NFKC normalization: converts full-width chars to half-width equivalents
+    # e.g., ＜ → <, ＞ → >, full-width space → regular space
+    normalized = unicodedata.normalize("NFKC", name)
+
+    # Replace Japanese brackets with regular quotes
+    normalized = normalized.replace("「", '"').replace("」", '"')
+
+    # Collapse multiple whitespace to single space and trim
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # Lowercase for case-insensitive comparison
+    normalized = normalized.lower()
+
+    return normalized
 
 
 class Event(TypedDict):
@@ -210,8 +243,10 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         # Format date as YYYY-MM-DD
         date_str = f"{year}-{month:02d}-{day:02d}"
 
-        # Use (date, name) as unique key - later occurrences update start_time
-        key = (date_str, event_name)
+        # Use (date, normalized_name) as unique key for deduplication
+        # This handles full-width/half-width chars, case differences, etc.
+        normalized_name = normalize_event_name(event_name)
+        key = (date_str, normalized_name)
         events_dict[key] = Event(
             date=date_str,
             name=event_name,
@@ -237,9 +272,10 @@ def get_next_month(year: int, month: int) -> tuple[int, int]:
 
 
 def deduplicate_events(events: list[Event]) -> list[Event]:
-    """Deduplicate events by (date, name) key.
+    """Deduplicate events by (date, normalized_name) key.
 
     If duplicate events exist, the later occurrence's start_time is kept.
+    Uses normalized name for comparison to handle character variations.
 
     Args:
         events: List of Event dictionaries.
@@ -249,7 +285,7 @@ def deduplicate_events(events: list[Event]) -> list[Event]:
     """
     events_dict: dict[tuple[str, str], Event] = {}
     for event in events:
-        key = (event["date"], event["name"])
+        key = (event["date"], normalize_event_name(event["name"]))
         events_dict[key] = event
     return list(events_dict.values())
 
