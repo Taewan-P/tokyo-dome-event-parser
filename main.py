@@ -163,16 +163,17 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         month: Target month (1-12).
 
     Returns:
-        List of Event dictionaries for the specified month.
+        List of Event dictionaries for the specified month (deduplicated by date+name).
     """
     soup = BeautifulSoup(html, "lxml")
-    events: list[Event] = []
+    # Use dict keyed by (date, name) to deduplicate events
+    events_dict: dict[tuple[str, str], Event] = {}
 
     # Find the table for the target month
     target_table = find_month_table(soup, year, month)
 
     if not target_table:
-        return events
+        return []
 
     # Parse table rows
     rows = target_table.find_all("tr")
@@ -209,15 +210,15 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         # Format date as YYYY-MM-DD
         date_str = f"{year}-{month:02d}-{day:02d}"
 
-        events.append(
-            Event(
-                date=date_str,
-                name=event_name,
-                start_time=start_time,
-            )
+        # Use (date, name) as unique key - later occurrences update start_time
+        key = (date_str, event_name)
+        events_dict[key] = Event(
+            date=date_str,
+            name=event_name,
+            start_time=start_time,
         )
 
-    return events
+    return list(events_dict.values())
 
 
 def get_next_month(year: int, month: int) -> tuple[int, int]:
@@ -235,11 +236,29 @@ def get_next_month(year: int, month: int) -> tuple[int, int]:
     return year, month + 1
 
 
+def deduplicate_events(events: list[Event]) -> list[Event]:
+    """Deduplicate events by (date, name) key.
+
+    If duplicate events exist, the later occurrence's start_time is kept.
+
+    Args:
+        events: List of Event dictionaries.
+
+    Returns:
+        Deduplicated list of Event dictionaries.
+    """
+    events_dict: dict[tuple[str, str], Event] = {}
+    for event in events:
+        key = (event["date"], event["name"])
+        events_dict[key] = event
+    return list(events_dict.values())
+
+
 def get_events() -> list[Event]:
     """Fetch and parse events for the current month and next month.
 
     Returns:
-        List of Event dictionaries for current and next month.
+        List of Event dictionaries for current and next month (deduplicated).
     """
     now = datetime.now()
     html = fetch_schedule_html()
@@ -251,7 +270,8 @@ def get_events() -> list[Event]:
     next_year, next_month = get_next_month(now.year, now.month)
     events.extend(parse_events(html, next_year, next_month))
 
-    return events
+    # Deduplicate across both months
+    return deduplicate_events(events)
 
 
 def escape_sql_string(value: str) -> str:
@@ -292,12 +312,50 @@ def generate_upsert_sql(events: list[Event]) -> str:
     return "\n".join(statements)
 
 
-def ensure_unique_index() -> bool:
-    """Ensure the unique index exists on the events table.
+def remove_duplicates_from_db() -> bool:
+    """Remove duplicate events from the database, keeping the one with the latest start_time.
+
+    Duplicates are defined as rows with the same (date, name).
 
     Returns:
         True if successful, False otherwise.
     """
+    # Delete duplicates, keeping the row with the MAX(rowid) for each (date, name)
+    # This keeps the most recently inserted record
+    sql = """
+    DELETE FROM events
+    WHERE rowid NOT IN (
+        SELECT MAX(rowid)
+        FROM events
+        GROUP BY date, name
+    );
+    """
+
+    try:
+        result = subprocess.run(
+            ["wrangler", "d1", "execute", D1_DATABASE_NAME, "--command", sql.strip(), "--remote"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        print("Removed duplicate events from database.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Could not remove duplicates: {e.stderr}")
+        return False
+
+
+def ensure_unique_index() -> bool:
+    """Ensure the unique index exists on the events table.
+
+    First removes any existing duplicates, then creates the index.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    # First, remove any existing duplicates so the unique index can be created
+    remove_duplicates_from_db()
+
     sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_date_name ON events(date, name);"
 
     try:
