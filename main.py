@@ -556,10 +556,8 @@ def one_off_cleanup_fuzzy_duplicates_in_d1() -> bool:
 
     rewrite_sql = "\n".join(
         [
-            "BEGIN TRANSACTION;",
             "DELETE FROM events;",
             generate_upsert_sql(deduplicated_events),
-            "COMMIT;",
         ]
     )
 
