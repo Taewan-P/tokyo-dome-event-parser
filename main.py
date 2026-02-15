@@ -6,6 +6,7 @@ structured data ready for database insertion.
 """
 
 import argparse
+from difflib import SequenceMatcher
 import json
 import re
 import subprocess
@@ -20,6 +21,7 @@ from bs4 import BeautifulSoup
 # Constants
 SCHEDULE_URL = "https://www.tokyo-dome.co.jp/en/dome/event/schedule.html"
 D1_DATABASE_NAME = "tokyo-dome-events"
+EVENT_NAME_SIMILARITY_THRESHOLD = 0.80
 
 
 def normalize_event_name(name: str) -> str:
@@ -60,6 +62,25 @@ class Event(TypedDict):
     date: str  # YYYY-MM-DD format
     name: str  # Event name
     start_time: str  # HH:MM format
+
+
+def name_similarity(left: str, right: str) -> float:
+    """Calculate similarity ratio between two normalized event names."""
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def is_same_event_name(left: str, right: str) -> bool:
+    """Check if two normalized event names should be treated as the same event."""
+    return name_similarity(left, right) >= EVENT_NAME_SIMILARITY_THRESHOLD
+
+
+def prefer_event_name(current: Event, candidate: Event) -> Event:
+    """Choose the more descriptive event when two entries represent the same event."""
+    current_normalized = normalize_event_name(current["name"])
+    candidate_normalized = normalize_event_name(candidate["name"])
+    if len(candidate_normalized) > len(current_normalized):
+        return candidate
+    return current
 
 
 def fetch_schedule_html() -> str:
@@ -196,11 +217,10 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         month: Target month (1-12).
 
     Returns:
-        List of Event dictionaries for the specified month (deduplicated by date+name).
+        List of Event dictionaries for the specified month (fuzzy deduplicated).
     """
     soup = BeautifulSoup(html, "lxml")
-    # Use dict keyed by (date, name) to deduplicate events
-    events_dict: dict[tuple[str, str], Event] = {}
+    events: list[Event] = []
 
     # Find the table for the target month
     target_table = find_month_table(soup, year, month)
@@ -243,17 +263,13 @@ def parse_events(html: str, year: int, month: int) -> list[Event]:
         # Format date as YYYY-MM-DD
         date_str = f"{year}-{month:02d}-{day:02d}"
 
-        # Use (date, normalized_name) as unique key for deduplication
-        # This handles full-width/half-width chars, case differences, etc.
-        normalized_name = normalize_event_name(event_name)
-        key = (date_str, normalized_name)
-        events_dict[key] = Event(
+        events.append(Event(
             date=date_str,
             name=event_name,
             start_time=start_time,
-        )
+        ))
 
-    return list(events_dict.values())
+    return deduplicate_events(events)
 
 
 def get_next_month(year: int, month: int) -> tuple[int, int]:
@@ -272,10 +288,12 @@ def get_next_month(year: int, month: int) -> tuple[int, int]:
 
 
 def deduplicate_events(events: list[Event]) -> list[Event]:
-    """Deduplicate events by (date, normalized_name) key.
+    """Deduplicate events by fuzzy name match within the same date+start_time.
 
-    If duplicate events exist, the later occurrence's start_time is kept.
-    Uses normalized name for comparison to handle character variations.
+    Events are considered duplicates when:
+    - date is the same
+    - start_time is the same
+    - normalized names have high similarity
 
     Args:
         events: List of Event dictionaries.
@@ -283,11 +301,28 @@ def deduplicate_events(events: list[Event]) -> list[Event]:
     Returns:
         Deduplicated list of Event dictionaries.
     """
-    events_dict: dict[tuple[str, str], Event] = {}
+    grouped_events: dict[tuple[str, str], list[tuple[Event, str]]] = {}
+
     for event in events:
-        key = (event["date"], normalize_event_name(event["name"]))
-        events_dict[key] = event
-    return list(events_dict.values())
+        key = (event["date"], event["start_time"])
+        normalized_name = normalize_event_name(event["name"])
+        candidates = grouped_events.setdefault(key, [])
+
+        match_index = None
+        for index, (_, existing_normalized_name) in enumerate(candidates):
+            if is_same_event_name(existing_normalized_name, normalized_name):
+                match_index = index
+                break
+
+        if match_index is None:
+            candidates.append((event, normalized_name))
+            continue
+
+        existing_event = candidates[match_index][0]
+        preferred_event = prefer_event_name(existing_event, event)
+        candidates[match_index] = (preferred_event, normalize_event_name(preferred_event["name"]))
+
+    return [event for grouped in grouped_events.values() for event, _ in grouped]
 
 
 def get_events() -> list[Event]:
@@ -445,17 +480,130 @@ def save_events_to_d1(events: list[Event]) -> bool:
         return False
 
 
+def run_d1_command(sql: str, json_output: bool = False) -> str:
+    """Run a SQL command against D1 and return stdout."""
+    command = ["wrangler", "d1", "execute", D1_DATABASE_NAME, "--command", sql, "--remote"]
+    if json_output:
+        command.append("--json")
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def load_events_from_d1() -> list[Event]:
+    """Load all events from D1 for one-off fuzzy deduplication."""
+    sql = "SELECT date, name, COALESCE(start_time, '00:00') AS start_time FROM events;"
+    raw_output = run_d1_command(sql, json_output=True)
+    payload = json.loads(raw_output)
+
+    if not isinstance(payload, list):
+        return []
+
+    rows: list[Event] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        results = entry.get("results", [])
+        if not isinstance(results, list):
+            continue
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            date = row.get("date")
+            name = row.get("name")
+            start_time = row.get("start_time")
+            if isinstance(date, str) and isinstance(name, str) and isinstance(start_time, str):
+                rows.append(
+                    Event(
+                        date=date,
+                        name=name,
+                        start_time=start_time,
+                    )
+                )
+
+    return rows
+
+
+def one_off_cleanup_fuzzy_duplicates_in_d1() -> bool:
+    """Run one-off fuzzy duplicate cleanup directly on D1."""
+    try:
+        current_events = load_events_from_d1()
+    except subprocess.CalledProcessError as e:
+        print(f"Error loading events from D1: {e.stderr}")
+        return False
+    except json.JSONDecodeError as e:
+        print(f"Error parsing D1 JSON response: {e}")
+        return False
+    except FileNotFoundError:
+        print("Error: Wrangler CLI not found. Please install it with: npm install -g wrangler")
+        return False
+
+    if not current_events:
+        print("No events found in D1. Cleanup not needed.")
+        return True
+
+    deduplicated_events = deduplicate_events(current_events)
+    removed_count = len(current_events) - len(deduplicated_events)
+
+    if removed_count <= 0:
+        print("No fuzzy duplicates found in D1.")
+        return True
+
+    rewrite_sql = "\n".join(
+        [
+            "BEGIN TRANSACTION;",
+            "DELETE FROM events;",
+            generate_upsert_sql(deduplicated_events),
+            "COMMIT;",
+        ]
+    )
+
+    try:
+        run_d1_command(rewrite_sql)
+        print(
+            "Fuzzy duplicate cleanup completed. "
+            f"Removed {removed_count} rows ({len(current_events)} -> {len(deduplicated_events)})."
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error rewriting events table in D1: {e.stderr}")
+        return False
+    except FileNotFoundError:
+        print("Error: Wrangler CLI not found. Please install it with: npm install -g wrangler")
+        return False
+
+
 def main() -> None:
     """Main entry point - fetches and optionally saves events for current and next month."""
     parser = argparse.ArgumentParser(
-        description="Parse Tokyo Dome events (current + next month) and optionally save to Cloudflare D1."
+        description=(
+            "Parse Tokyo Dome events (current + next month), optionally save to Cloudflare D1, "
+            "and optionally run one-off fuzzy cleanup in D1."
+        )
     )
     parser.add_argument(
         "--save",
         action="store_true",
         help="Save parsed events to Cloudflare D1 database",
     )
+    parser.add_argument(
+        "--cleanup-fuzzy",
+        action="store_true",
+        help="One-off: fuzzy-deduplicate existing D1 rows by date+start_time+similar name",
+    )
     args = parser.parse_args()
+
+    if args.cleanup_fuzzy and not args.save:
+        print("Running one-off fuzzy cleanup in Cloudflare D1...")
+        success = one_off_cleanup_fuzzy_duplicates_in_d1()
+        if not success:
+            sys.exit(1)
+        return
 
     try:
         events = get_events()
@@ -465,6 +613,12 @@ def main() -> None:
         if args.save:
             print("\nSaving to Cloudflare D1...")
             success = save_events_to_d1(events)
+            if not success:
+                sys.exit(1)
+
+        if args.cleanup_fuzzy:
+            print("\nRunning one-off fuzzy cleanup in Cloudflare D1...")
+            success = one_off_cleanup_fuzzy_duplicates_in_d1()
             if not success:
                 sys.exit(1)
 
