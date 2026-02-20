@@ -445,7 +445,8 @@ def ensure_unique_index() -> bool:
 def save_events_to_d1(events: list[Event]) -> bool:
     """Save events to Cloudflare D1 database using Wrangler CLI.
 
-    Performs upsert based on (date, name) unique constraint.
+    Loads existing rows, merges with incoming rows, fuzzy-deduplicates,
+    then rewrites the table once.
 
     Args:
         events: List of Event dictionaries to save.
@@ -460,20 +461,28 @@ def save_events_to_d1(events: list[Event]) -> bool:
     # Ensure the unique index exists
     ensure_unique_index()
 
-    # Generate and execute upsert SQL
-    sql = generate_upsert_sql(events)
-
     try:
-        result = subprocess.run(
-            ["wrangler", "d1", "execute", D1_DATABASE_NAME, "--command", sql, "--remote"],
-            capture_output=True,
-            text=True,
-            check=True,
+        existing_events = load_events_from_d1()
+        merged_events = deduplicate_events(existing_events + events)
+
+        rewrite_sql = "\n".join(
+            [
+                "DELETE FROM events;",
+                generate_upsert_sql(merged_events),
+            ]
         )
-        print(f"Successfully saved {len(events)} events to D1 database.")
+
+        run_d1_command(rewrite_sql)
+        print(
+            "Successfully saved with fuzzy dedup. "
+            f"Incoming: {len(events)}, total rows: {len(merged_events)}."
+        )
         return True
     except subprocess.CalledProcessError as e:
         print(f"Error saving to D1: {e.stderr}")
+        return False
+    except json.JSONDecodeError as e:
+        print(f"Error parsing D1 JSON response: {e}")
         return False
     except FileNotFoundError:
         print("Error: Wrangler CLI not found. Please install it with: npm install -g wrangler")
@@ -581,7 +590,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Parse Tokyo Dome events (current + next month), optionally save to Cloudflare D1, "
-            "and optionally run one-off fuzzy cleanup in D1."
+            "and optionally run manual one-off fuzzy cleanup in D1."
         )
     )
     parser.add_argument(
@@ -592,7 +601,7 @@ def main() -> None:
     parser.add_argument(
         "--cleanup-fuzzy",
         action="store_true",
-        help="One-off: fuzzy-deduplicate existing D1 rows by date+start_time+similar name",
+        help="Manual one-off: fuzzy-deduplicate existing D1 rows by date+start_time+similar name",
     )
     args = parser.parse_args()
 
@@ -614,11 +623,8 @@ def main() -> None:
             if not success:
                 sys.exit(1)
 
-        if args.cleanup_fuzzy:
-            print("\nRunning one-off fuzzy cleanup in Cloudflare D1...")
-            success = one_off_cleanup_fuzzy_duplicates_in_d1()
-            if not success:
-                sys.exit(1)
+        if args.cleanup_fuzzy and args.save:
+            print("\nSkipping --cleanup-fuzzy: --save already performs fuzzy dedup merge.")
 
     except requests.RequestException as e:
         print(f"Error fetching schedule: {e}")
